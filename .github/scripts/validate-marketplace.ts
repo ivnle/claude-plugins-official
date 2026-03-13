@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 /**
- * Validates that marketplace.json is well-formed JSON with a plugins array.
+ * Validates marketplace.json: well-formed JSON, plugins array present,
+ * each entry has required fields, and no duplicate plugin names.
  *
  * Usage:
  *   bun validate-marketplace.ts <path-to-marketplace.json>
@@ -38,9 +39,36 @@ async function main() {
     process.exit(1);
   }
 
-  console.log(
-    `marketplace.json is valid (${marketplace.plugins.length} plugins)`
-  );
+  const errors: string[] = [];
+  const seen = new Set<string>();
+  const required = ["name", "description", "source"] as const;
+
+  marketplace.plugins.forEach((p, i) => {
+    if (!p || typeof p !== "object") {
+      errors.push(`plugins[${i}]: must be an object`);
+      return;
+    }
+    const entry = p as Record<string, unknown>;
+    for (const field of required) {
+      if (!entry[field]) {
+        errors.push(`plugins[${i}] (${entry.name ?? "?"}): missing required field "${field}"`);
+      }
+    }
+    if (typeof entry.name === "string") {
+      if (seen.has(entry.name)) {
+        errors.push(`plugins[${i}]: duplicate plugin name "${entry.name}"`);
+      }
+      seen.add(entry.name);
+    }
+  });
+
+  if (errors.length) {
+    console.error(`ERROR: ${filePath} has ${errors.length} validation error(s):`);
+    for (const e of errors) console.error(`  - ${e}`);
+    process.exit(1);
+  }
+
+  console.log(`OK: ${marketplace.plugins.length} plugins, no duplicates, all required fields present`);
 }
 
 main().catch((err) => {
