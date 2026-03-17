@@ -1027,6 +1027,17 @@
         "sha": "54d7a9db2ddd476f84d5d1fd7bac323907858a8b"
       },
       "homepage": "https://github.com/neondatabase/agent-skills/tree/main/plugins/neon-postgres"
+    },
+    {
+      "name": "intercom",
+      "description": "Intercom integration for Claude Code. Search conversations, analyze customer support patterns, look up contacts and companies, and install the Intercom Messenger. Connect your Intercom workspace to get real-time insights from customer data.",
+      "category": "productivity",
+      "source": {
+        "source": "url",
+        "url": "https://github.com/intercom/claude-plugin-external.git",
+        "sha": "eeef353eead2e3dc5f33f64dbaae54e1309e0d45"
+      },
+      "homepage": "https://github.com/intercom/claude-plugin-external"
     }
   ]
 }
