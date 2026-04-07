@@ -427,6 +427,61 @@ async function downloadAttachment(att: Attachment): Promise<string> {
   return path
 }
 
+// Transcribe an audio file via Gemini. Returns the transcript text, or null
+// on any failure (missing API key, HTTP error, malformed response) so the
+// caller can fall back to the normal "list in meta, let Claude download"
+// flow. Model matches ~/research/transcribe/config.yaml.
+const TRANSCRIBE_PROMPT =
+  'Transcribe this audio verbatim. Output ONLY the transcribed text, ' +
+  'nothing else. No preamble, no quotes, no labels, no formatting. ' +
+  'The speaker is an ML researcher at UCSD. ' +
+  'Domain terms: vLLM, COLM (sounds like "column", a conference), BPB, ' +
+  'LoRA (sounds like "Laura", Low-Rank Adaptation), Muon optimizer, ' +
+  'wandb (sounds like "wand-B", Weights & Biases), whiletrue, eval-llm, ' +
+  'format-tax, good-struct, the-count, pyproject.toml, uv, ' +
+  'jot (a CLI tool for notes/todos, always lowercase — not "jot down"), autota, ' +
+  'Piazza, arXiv, ICML, NeurIPS, Anthropic, Claude, Sonnet, Opus, Haiku.'
+
+async function transcribeAudio(path: string, mimeType: string): Promise<string | null> {
+  const apiKey = process.env.GEMINI_API_KEY ?? process.env.GOOGLE_API_KEY
+  if (!apiKey) {
+    process.stderr.write('discord: transcribeAudio skipped — no GEMINI_API_KEY/GOOGLE_API_KEY in env\n')
+    return null
+  }
+  try {
+    const buf = readFileSync(path)
+    const base64 = buf.toString('base64')
+    const model = process.env.DISCORD_TRANSCRIBE_MODEL ?? 'gemini-3.1-flash-lite-preview'
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`
+    const body = {
+      contents: [
+        {
+          parts: [
+            { text: TRANSCRIBE_PROMPT },
+            { inline_data: { mime_type: mimeType, data: base64 } },
+          ],
+        },
+      ],
+    }
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+    if (!res.ok) {
+      const errText = await res.text().catch(() => '<no body>')
+      process.stderr.write(`discord: gemini transcription failed: ${res.status} ${errText}\n`)
+      return null
+    }
+    const data = (await res.json()) as any
+    const text = data?.candidates?.[0]?.content?.parts?.[0]?.text
+    return typeof text === 'string' ? text.trim() : null
+  } catch (err) {
+    process.stderr.write(`discord: transcription error: ${err}\n`)
+    return null
+  }
+}
+
 // att.name is uploader-controlled. It lands inside a [...] annotation in the
 // notification body and inside a newline-joined tool result — both are places
 // where delimiter chars let the attacker break out of the untrusted frame.
@@ -852,18 +907,42 @@ async function handleInbound(msg: Message): Promise<void> {
     void msg.react(access.ackReaction).catch(() => {})
   }
 
-  // Attachments are listed (name/type/size) but not downloaded — the model
-  // calls download_attachment when it wants them. Keeps the notification
-  // fast and avoids filling inbox/ with images nobody looked at.
+  // Attachments: audio is downloaded + transcribed inline so Claude sees
+  // plain text. Non-audio attachments keep the original behavior — listed
+  // in meta only, the model calls download_attachment when it wants them.
+  // Audio is inlined because voice notes are the common case and making
+  // the model do a round-trip to decode them wastes a turn.
   const atts: string[] = []
+  const transcripts: string[] = []
   for (const att of msg.attachments.values()) {
+    const isAudio = att.contentType?.startsWith('audio/') ?? false
+    if (isAudio) {
+      try {
+        const path = await downloadAttachment(att)
+        const transcript = await transcribeAudio(path, att.contentType!)
+        if (transcript) {
+          transcripts.push(transcript)
+          continue // skip meta listing — Claude sees the text directly
+        }
+      } catch (err) {
+        process.stderr.write(`discord: audio transcribe failed, falling back to meta listing: ${err}\n`)
+      }
+    }
     const kb = (att.size / 1024).toFixed(0)
     atts.push(`${safeAttName(att)} (${att.contentType ?? 'unknown'}, ${kb}KB)`)
   }
 
-  // Attachment listing goes in meta only — an in-content annotation is
-  // forgeable by any allowlisted sender typing that string.
-  const content = msg.content || (atts.length > 0 ? '(attachment)' : '')
+  // Combine any typed text with transcripts. Voice-note-only messages
+  // become pure-text messages from Claude's perspective; text+voice
+  // combines both. Attachment listing goes in meta only — an in-content
+  // annotation is forgeable by any allowlisted sender typing that string.
+  let content = msg.content
+  if (transcripts.length > 0) {
+    const joined = transcripts.join('\n\n')
+    content = content ? `${content}\n\n${joined}` : joined
+  } else if (!content && atts.length > 0) {
+    content = '(attachment)'
+  }
 
   mcp.notification({
     method: 'notifications/claude/channel',
