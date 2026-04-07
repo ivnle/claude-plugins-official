@@ -922,6 +922,24 @@ async function handleInbound(msg: Message): Promise<void> {
         const transcript = await transcribeAudio(path, att.contentType!)
         if (transcript) {
           transcripts.push(transcript)
+          // Echo the transcript back to Discord as a quoted reply so the
+          // sender can see what was heard. Fire-and-forget — a failed echo
+          // shouldn't block the main notification flow. Subtext format
+          // (-#) renders as small grey text, visually distinct from real
+          // replies. allowedMentions empty so transcribed @names don't
+          // accidentally ping real users.
+          const DISCORD_MSG_LIMIT = 2000
+          const PREFIX = '-# 🎤 _transcribed:_ '
+          const maxBody = DISCORD_MSG_LIMIT - PREFIX.length - 1 // -1 for safety
+          const body = transcript.length > maxBody
+            ? transcript.slice(0, maxBody - 1) + '…'
+            : transcript
+          void msg.reply({
+            content: `${PREFIX}${body}`,
+            allowedMentions: { parse: [] },
+          }).catch(err => {
+            process.stderr.write(`discord: transcript echo failed: ${err}\n`)
+          })
           continue // skip meta listing — Claude sees the text directly
         }
       } catch (err) {
