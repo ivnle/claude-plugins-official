@@ -431,16 +431,29 @@ async function downloadAttachment(att: Attachment): Promise<string> {
 // on any failure (missing API key, HTTP error, malformed response) so the
 // caller can fall back to the normal "list in meta, let Claude download"
 // flow. Model matches ~/research/transcribe/config.yaml.
-const TRANSCRIBE_PROMPT =
+//
+// Prompt is loaded from the file at $TRANSCRIBE_PROMPT_FILE so dictate,
+// the `transcribe` CLI, and this plugin all share a single source of truth
+// for vocabulary/domain terms. The bot runner sets this env var to
+// research/transcribe/prompt.txt. Falls back to a minimal generic prompt
+// if the env var is unset or the file is unreadable — that keeps the
+// plugin usable outside the monorepo.
+const TRANSCRIBE_PROMPT_FALLBACK =
   'Transcribe this audio verbatim. Output ONLY the transcribed text, ' +
-  'nothing else. No preamble, no quotes, no labels, no formatting. ' +
-  'The speaker is an ML researcher at UCSD. ' +
-  'Domain terms: vLLM, COLM (sounds like "column", a conference), BPB, ' +
-  'LoRA (sounds like "Laura", Low-Rank Adaptation), Muon optimizer, ' +
-  'wandb (sounds like "wand-B", Weights & Biases), whiletrue, eval-llm, ' +
-  'format-tax, good-struct, the-count, pyproject.toml, uv, ' +
-  'jot (a CLI tool for notes/todos, always lowercase — not "jot down"), autota, ' +
-  'Piazza, arXiv, ICML, NeurIPS, Anthropic, Claude, Sonnet, Opus, Haiku.'
+  'nothing else. No preamble, no quotes, no labels, no formatting.'
+
+function loadTranscribePrompt(): string {
+  const path = process.env.TRANSCRIBE_PROMPT_FILE
+  if (!path) return TRANSCRIBE_PROMPT_FALLBACK
+  try {
+    return readFileSync(path, 'utf8').trim()
+  } catch (err) {
+    process.stderr.write(`discord: TRANSCRIBE_PROMPT_FILE=${path} unreadable (${err}); using fallback\n`)
+    return TRANSCRIBE_PROMPT_FALLBACK
+  }
+}
+
+const TRANSCRIBE_PROMPT = loadTranscribePrompt()
 
 async function transcribeAudio(path: string, mimeType: string): Promise<string | null> {
   const apiKey = process.env.GEMINI_API_KEY ?? process.env.GOOGLE_API_KEY
