@@ -30,9 +30,13 @@ import {
   type Interaction,
 } from 'discord.js'
 import { randomBytes } from 'crypto'
-import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
+import { execFile } from 'child_process'
+import { promisify } from 'util'
+import { readFileSync, writeFileSync, appendFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
 import { homedir } from 'os'
-import { join, sep } from 'path'
+import { join, sep, dirname } from 'path'
+
+const execFileAsync = promisify(execFile)
 
 const STATE_DIR = process.env.DISCORD_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'discord')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -454,6 +458,67 @@ function loadTranscribePrompt(): string {
 }
 
 const TRANSCRIBE_PROMPT = loadTranscribePrompt()
+
+// -------- Phase 2: shadow-mode CLI integration --------
+//
+// The monorepo's transcribe CLI (see transcribe/SPEC-v2.md) is the target
+// unified transcription service. This plugin previously had its own
+// inline Gemini call; the `transcribeViaCli` wrapper below is the new
+// path. Which path runs is controlled by two env vars:
+//
+//   TRANSCRIBE_USE_CLI=1    Use the CLI's output as the canonical transcript
+//                           that the model sees.
+//   TRANSCRIBE_SHADOW=1     Always also run the *other* path in parallel
+//                           and log both results to a shadow log for
+//                           offline comparison. The user-facing output is
+//                           whatever USE_CLI decided.
+//
+// Both default off — the plugin behaves as before unless you set them.
+
+const TRANSCRIBE_CLI_BIN = '/Users/ivanlee/research/transcribe/.venv/bin/transcribe'
+const SHADOW_LOG_PATH = '/Users/ivanlee/research/transcribe/.logs/shadow.jsonl'
+
+type CliResult = {
+  raw: string
+  final: string
+  distilled: boolean
+  backend_used: { transcribe: string; distill: string | null }
+  models_used: { transcribe: string; distill: string | null }
+  latency_ms: { transcode: number; transcribe: number; distill: number | null; total: number }
+  fallback_fired: { transcribe: boolean; distill: boolean }
+}
+
+async function transcribeViaCli(path: string): Promise<CliResult | null> {
+  try {
+    const { stdout } = await execFileAsync(
+      TRANSCRIBE_CLI_BIN,
+      [path, '--json', '--distill'],
+      { timeout: 120_000, maxBuffer: 10 * 1024 * 1024, encoding: 'utf8' },
+    )
+    const parsed = JSON.parse(stdout) as any
+    if (parsed.error) {
+      process.stderr.write(`discord: CLI transcription error: ${parsed.error.code} ${parsed.error.message}\n`)
+      return null
+    }
+    return parsed as CliResult
+  } catch (err: any) {
+    const msg = err?.stderr ? String(err.stderr) : String(err)
+    process.stderr.write(`discord: CLI transcription exec failed: ${msg}\n`)
+    return null
+  }
+}
+
+function logShadow(entry: Record<string, unknown>): void {
+  try {
+    mkdirSync(dirname(SHADOW_LOG_PATH), { recursive: true })
+    appendFileSync(
+      SHADOW_LOG_PATH,
+      JSON.stringify({ ts: new Date().toISOString(), ...entry }) + '\n',
+    )
+  } catch (err) {
+    process.stderr.write(`discord: shadow log write failed: ${err}\n`)
+  }
+}
 
 async function transcribeAudio(path: string, mimeType: string): Promise<string | null> {
   const apiKey = process.env.GEMINI_API_KEY ?? process.env.GOOGLE_API_KEY
@@ -932,7 +997,44 @@ async function handleInbound(msg: Message): Promise<void> {
     if (isAudio) {
       try {
         const path = await downloadAttachment(att)
-        const transcript = await transcribeAudio(path, att.contentType!)
+        const useCli = process.env.TRANSCRIBE_USE_CLI === '1'
+        const shadow = process.env.TRANSCRIBE_SHADOW === '1'
+
+        let transcript: string | null = null
+        let cliResult: CliResult | null = null
+        let inlineResult: string | null = null
+
+        if (useCli || shadow) {
+          cliResult = await transcribeViaCli(path)
+        }
+        if (!useCli || shadow) {
+          inlineResult = await transcribeAudio(path, att.contentType!)
+        }
+
+        transcript = useCli ? (cliResult?.final ?? null) : inlineResult
+
+        if (shadow) {
+          logShadow({
+            message_id: msg.id,
+            channel_id: msg.channelId,
+            user_id: msg.author.id,
+            audio_path: path,
+            audio_size: att.size,
+            audio_mime: att.contentType,
+            primary_path: useCli ? 'cli' : 'inline',
+            cli: cliResult && {
+              raw: cliResult.raw,
+              final: cliResult.final,
+              distilled: cliResult.distilled,
+              backend: cliResult.backend_used,
+              models: cliResult.models_used,
+              latency_ms: cliResult.latency_ms,
+              fallback: cliResult.fallback_fired,
+            },
+            inline: { transcript: inlineResult },
+          })
+        }
+
         if (transcript) {
           transcripts.push(transcript)
           // Echo the transcript back to Discord as a quoted reply so the
