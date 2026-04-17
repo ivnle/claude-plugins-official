@@ -1003,12 +1003,18 @@ async function handleInbound(msg: Message): Promise<void> {
         let transcript: string | null = null
         let cliResult: CliResult | null = null
         let inlineResult: string | null = null
+        let cliWallMs: number | null = null
+        let inlineWallMs: number | null = null
 
         if (useCli || shadow) {
+          const t0 = Date.now()
           cliResult = await transcribeViaCli(path)
+          cliWallMs = Date.now() - t0
         }
         if (!useCli || shadow) {
+          const t0 = Date.now()
           inlineResult = await transcribeAudio(path, att.contentType!)
+          inlineWallMs = Date.now() - t0
         }
 
         transcript = useCli ? (cliResult?.final ?? null) : inlineResult
@@ -1029,9 +1035,10 @@ async function handleInbound(msg: Message): Promise<void> {
               backend: cliResult.backend_used,
               models: cliResult.models_used,
               latency_ms: cliResult.latency_ms,
+              wall_ms: cliWallMs,
               fallback: cliResult.fallback_fired,
             },
-            inline: { transcript: inlineResult },
+            inline: { transcript: inlineResult, wall_ms: inlineWallMs },
           })
         }
 
