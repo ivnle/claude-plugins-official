@@ -516,7 +516,7 @@ async function transcribeViaCli(path: string): Promise<CliResult | null> {
     if (ctx && ctx.trim().length > 0) {
       ctxPath = `/tmp/discord-ctx-${process.pid}-${Date.now()}.txt`
       writeFileSync(ctxPath, ctx)
-      args.push('--context-file', ctxPath)
+      args.push('--context-file', ctxPath, '--context-source', 'tmux')
     }
     const { stdout } = await execFileAsync(
       TRANSCRIBE_CLI_BIN,
