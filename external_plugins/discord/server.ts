@@ -488,11 +488,39 @@ type CliResult = {
   fallback_fired: { transcribe: boolean; distill: boolean }
 }
 
-async function transcribeViaCli(path: string): Promise<CliResult | null> {
+// Capture the tail of the bot's own tmux pane as transcribe-stage context
+// (proper-noun disambiguation). BOT_TMUX_SESSION is injected by the bot
+// runner; absent → no context, function returns null. tmux unavailable or
+// session missing → log + return null; the caller degrades gracefully.
+async function captureTmuxContext(): Promise<string | null> {
+  const session = process.env.BOT_TMUX_SESSION
+  if (!session) return null
   try {
     const { stdout } = await execFileAsync(
+      'tmux',
+      ['capture-pane', '-t', session, '-p', '-S', '-200'],
+      { timeout: 5_000, maxBuffer: 1 * 1024 * 1024, encoding: 'utf8' },
+    )
+    return stdout
+  } catch (err: any) {
+    process.stderr.write(`discord: tmux capture failed for ${session}: ${err}\n`)
+    return null
+  }
+}
+
+async function transcribeViaCli(path: string): Promise<CliResult | null> {
+  let ctxPath: string | null = null
+  try {
+    const ctx = await captureTmuxContext()
+    const args: string[] = [path, '--json', '--distill']
+    if (ctx && ctx.trim().length > 0) {
+      ctxPath = `/tmp/discord-ctx-${process.pid}-${Date.now()}.txt`
+      writeFileSync(ctxPath, ctx)
+      args.push('--context-file', ctxPath)
+    }
+    const { stdout } = await execFileAsync(
       TRANSCRIBE_CLI_BIN,
-      [path, '--json', '--distill'],
+      args,
       { timeout: 120_000, maxBuffer: 10 * 1024 * 1024, encoding: 'utf8' },
     )
     const parsed = JSON.parse(stdout) as any
@@ -505,6 +533,10 @@ async function transcribeViaCli(path: string): Promise<CliResult | null> {
     const msg = err?.stderr ? String(err.stderr) : String(err)
     process.stderr.write(`discord: CLI transcription exec failed: ${msg}\n`)
     return null
+  } finally {
+    if (ctxPath) {
+      try { rmSync(ctxPath, { force: true }) } catch {}
+    }
   }
 }
 
