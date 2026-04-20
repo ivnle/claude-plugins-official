@@ -122,6 +122,8 @@ type Access = {
   textChunkLimit?: number
   /** Split on paragraph boundaries instead of hard char count. */
   chunkMode?: 'length' | 'newline'
+  /** If set, route permission_request prompts to this channel ID instead of DMing allowlisted users. */
+  permissionsChannel?: string
 }
 
 function defaultAccess(): Access {
@@ -166,6 +168,7 @@ function readAccessFile(): Access {
       replyToMode: parsed.replyToMode,
       textChunkLimit: parsed.textChunkLimit,
       chunkMode: parsed.chunkMode,
+      permissionsChannel: parsed.permissionsChannel,
     }
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return defaultAccess()
@@ -666,15 +669,34 @@ mcp.setNotificationHandler(
         .setEmoji('❌')
         .setStyle(ButtonStyle.Danger),
     )
-    for (const userId of access.allowFrom) {
+    if (access.permissionsChannel) {
       void (async () => {
         try {
-          const user = await client.users.fetch(userId)
-          await user.send({ content: text, components: [row] })
+          const channel = await fetchTextChannel(access.permissionsChannel!)
+          await channel.send({ content: text, components: [row] })
         } catch (e) {
-          process.stderr.write(`permission_request send to ${userId} failed: ${e}\n`)
+          process.stderr.write(`permission_request send to channel ${access.permissionsChannel} failed (${e}); falling back to DMs\n`)
+          for (const userId of access.allowFrom) {
+            try {
+              const user = await client.users.fetch(userId)
+              await user.send({ content: text, components: [row] })
+            } catch (err) {
+              process.stderr.write(`permission_request DM fallback to ${userId} failed: ${err}\n`)
+            }
+          }
         }
       })()
+    } else {
+      for (const userId of access.allowFrom) {
+        void (async () => {
+          try {
+            const user = await client.users.fetch(userId)
+            await user.send({ content: text, components: [row] })
+          } catch (e) {
+            process.stderr.write(`permission_request send to ${userId} failed: ${e}\n`)
+          }
+        })()
+      }
     }
   },
 )
