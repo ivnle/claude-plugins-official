@@ -969,7 +969,18 @@ client.on('interactionCreate', async (interaction: Interaction) => {
         .setEmoji('❌')
         .setStyle(ButtonStyle.Danger),
     )
-    await interaction.update({ content: expanded, components: [row] }).catch(() => {})
+    // In a DM, only the pair sees the message, so replacing it in place is
+    // fine. In a guild channel, the original message is public — replacing
+    // it would expose input_preview (which can contain arguments, paths,
+    // URLs, etc.) to everyone with channel access. Send an ephemeral reply
+    // with just the expanded text (no Allow/Deny buttons; clicker uses the
+    // original public message's buttons) so input_preview stays private.
+    const inDM = interaction.channel?.isDMBased() ?? false
+    if (inDM) {
+      await interaction.update({ content: expanded, components: [row] }).catch(() => {})
+    } else {
+      await interaction.reply({ content: expanded, ephemeral: true }).catch(() => {})
+    }
     return
   }
 
