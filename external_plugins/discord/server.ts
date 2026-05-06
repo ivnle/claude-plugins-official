@@ -478,8 +478,11 @@ const TRANSCRIBE_PROMPT = loadTranscribePrompt()
 //
 // Both default off — the plugin behaves as before unless you set them.
 
-const TRANSCRIBE_CLI_BIN = '/Users/ivanlee/research/transcribe/.venv/bin/transcribe'
-const SHADOW_LOG_PATH = '/Users/ivanlee/research/transcribe/.logs/shadow.jsonl'
+// Set by the supervisor (bot/runner.py); null when the plugin is run
+// outside that supervisor. CLI-mode and shadow logging are skipped when
+// unset, so the inline Gemini path still works on any host.
+const TRANSCRIBE_CLI_BIN = process.env.TRANSCRIBE_CLI_BIN ?? null
+const SHADOW_LOG_PATH = process.env.TRANSCRIBE_SHADOW_LOG ?? null
 
 type CliResult = {
   raw: string
@@ -512,6 +515,10 @@ async function captureTmuxContext(): Promise<string | null> {
 }
 
 async function transcribeViaCli(path: string): Promise<CliResult | null> {
+  if (!TRANSCRIBE_CLI_BIN) {
+    process.stderr.write('discord: transcribeViaCli skipped — TRANSCRIBE_CLI_BIN not set\n')
+    return null
+  }
   let ctxPath: string | null = null
   try {
     const ctx = await captureTmuxContext()
@@ -544,6 +551,7 @@ async function transcribeViaCli(path: string): Promise<CliResult | null> {
 }
 
 function logShadow(entry: Record<string, unknown>): void {
+  if (!SHADOW_LOG_PATH) return
   try {
     mkdirSync(dirname(SHADOW_LOG_PATH), { recursive: true })
     appendFileSync(
