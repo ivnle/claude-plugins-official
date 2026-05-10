@@ -522,7 +522,7 @@ async function transcribeViaCli(path: string): Promise<CliResult | null> {
   let ctxPath: string | null = null
   try {
     const ctx = await captureTmuxContext()
-    const args: string[] = [path, '--json', '--distill']
+    const args: string[] = [path, '--json']
     if (ctx && ctx.trim().length > 0) {
       ctxPath = `/tmp/discord-ctx-${process.pid}-${Date.now()}.txt`
       writeFileSync(ctxPath, ctx)
