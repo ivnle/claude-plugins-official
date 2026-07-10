@@ -2,7 +2,18 @@
   "mcpServers": {
     "discord": {
       "command": "bun",
-      "args": ["run", "--cwd", "${CLAUDE_PLUGIN_ROOT}", "--shell=bun", "--silent", "start"]
+      "args": ["run", "--cwd", "${CLAUDE_PLUGIN_ROOT}", "--shell=bun", "--silent", "start"],
+      "env": {
+        "LOBSTER_TRANSPORT_SOCKET": "${LOBSTER_TRANSPORT_SOCKET:-}",
+        "DISCORD_BOT_TOKEN": "${DISCORD_BOT_TOKEN:-}",
+        "DISCORD_ACCESS_MODE": "${DISCORD_ACCESS_MODE:-}",
+        "DISCORD_STATE_DIR": "${DISCORD_STATE_DIR:-}",
+        "BOT_TMUX_SESSION": "${BOT_TMUX_SESSION:-}",
+        "TRANSCRIBE_CLI_BIN": "${TRANSCRIBE_CLI_BIN:-}",
+        "TRANSCRIBE_PROMPT_FILE": "${TRANSCRIBE_PROMPT_FILE:-}",
+        "GEMINI_API_KEY": "${GEMINI_API_KEY:-}",
+        "GOOGLE_API_KEY": "${GOOGLE_API_KEY:-}"
+      }
     }
   }
 }

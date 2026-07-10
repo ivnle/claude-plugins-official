@@ -31,6 +31,7 @@ import {
 } from 'discord.js'
 import { randomBytes } from 'crypto'
 import { execFile } from 'child_process'
+import { createConnection, type Socket } from 'net'
 import { promisify } from 'util'
 import { readFileSync, writeFileSync, appendFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
 import { homedir } from 'os'
@@ -54,10 +55,11 @@ try {
   }
 } catch {}
 
+const LOBSTER_TRANSPORT_SOCKET = process.env.LOBSTER_TRANSPORT_SOCKET ?? null
 const TOKEN = process.env.DISCORD_BOT_TOKEN
 const STATIC = process.env.DISCORD_ACCESS_MODE === 'static'
 
-if (!TOKEN) {
+if (!LOBSTER_TRANSPORT_SOCKET && !TOKEN) {
   process.stderr.write(
     `discord channel: DISCORD_BOT_TOKEN required\n` +
     `  set in ${ENV_FILE}\n` +
@@ -92,6 +94,164 @@ const client = new Client({
   // DMs arrive as partial channels — messageCreate never fires without this.
   partials: [Partials.Channel],
 })
+
+const CHANNEL_PROTOCOL = 'lobster-channel-v1'
+
+type LobsterInboundMessage = {
+  content: string
+  meta: {
+    chat_id: string
+    message_id: string
+    user: string
+    user_id: string
+    ts: string
+    attachment_count?: string
+    attachments?: string
+  }
+}
+
+type LobsterResponse =
+  | { type: 'response'; protocol: typeof CHANNEL_PROTOCOL; id: string; ok: true; result: unknown }
+  | { type: 'response'; protocol: typeof CHANNEL_PROTOCOL; id: string; ok: false; error: string }
+
+class LobsterTransportClient {
+  private socket: Socket | null = null
+  private connecting: Promise<void> | null = null
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null
+  private stopped = false
+  private buffer = ''
+  private nextId = 1
+  private readonly pending = new Map<string, { resolve: (value: unknown) => void; reject: (error: Error) => void }>()
+  private inboundHandler: ((message: LobsterInboundMessage) => void | Promise<void>) | null = null
+
+  constructor(private readonly socketPath: string) {}
+
+  onInbound(handler: (message: LobsterInboundMessage) => void | Promise<void>): void {
+    this.inboundHandler = handler
+  }
+
+  async connect(): Promise<void> {
+    if (this.socket) return
+    if (this.connecting) return this.connecting
+    const attempt = this.openSocket()
+    this.connecting = attempt
+    try {
+      await attempt
+    } finally {
+      if (this.connecting === attempt) this.connecting = null
+    }
+  }
+
+  private async openSocket(): Promise<void> {
+    const socket = createConnection(this.socketPath)
+    socket.setEncoding('utf8')
+    socket.on('data', chunk => void this.handleData(chunk))
+    socket.on('close', () => this.disconnected(socket, new Error('lobster transport closed')))
+    socket.on('error', err => {
+      if (this.socket === socket) this.rejectPending(err)
+    })
+    await new Promise<void>((resolve, reject) => {
+      socket.once('connect', resolve)
+      socket.once('error', reject)
+    })
+    if (this.stopped) {
+      socket.destroy()
+      return
+    }
+    this.socket = socket
+    this.buffer = ''
+    this.write({ type: 'hello', protocol: CHANNEL_PROTOCOL })
+  }
+
+  close(): void {
+    this.stopped = true
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer)
+    this.reconnectTimer = null
+    this.socket?.destroy()
+    this.socket = null
+    this.rejectPending(new Error('lobster transport stopped'))
+  }
+
+  request(op: string, params: Record<string, unknown>): Promise<unknown> {
+    if (!this.socket) return Promise.reject(new Error('lobster transport not connected'))
+    const id = `p${this.nextId++}`
+    const promise = new Promise<unknown>((resolve, reject) => {
+      this.pending.set(id, { resolve, reject })
+    })
+    this.write({ type: 'request', protocol: CHANNEL_PROTOCOL, id, op, params })
+    return promise
+  }
+
+  private write(frame: Record<string, unknown>): void {
+    this.socket?.write(`${JSON.stringify(frame)}\n`)
+  }
+
+  private disconnected(socket: Socket, error: Error): void {
+    if (this.socket !== null && this.socket !== socket) return
+    if (this.socket === socket) this.socket = null
+    this.buffer = ''
+    this.rejectPending(error)
+    this.scheduleReconnect()
+  }
+
+  private rejectPending(error: Error): void {
+    for (const { reject } of this.pending.values()) reject(error)
+    this.pending.clear()
+  }
+
+  private scheduleReconnect(): void {
+    if (this.stopped || this.reconnectTimer) return
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null
+      this.connect().catch(err => {
+        process.stderr.write(`lobster transport: reconnect failed: ${err}\n`)
+        this.scheduleReconnect()
+      })
+    }, 250)
+  }
+
+  private async handleData(chunk: string): Promise<void> {
+    this.buffer += chunk
+    const lines = this.buffer.split('\n')
+    this.buffer = lines.pop() ?? ''
+    for (const line of lines) {
+      if (!line.trim()) continue
+      let parsed: unknown
+      try {
+        parsed = JSON.parse(line)
+      } catch (err) {
+        process.stderr.write(`lobster transport: invalid JSON frame: ${err}\n`)
+        continue
+      }
+      if (!isRecord(parsed) || parsed.protocol !== CHANNEL_PROTOCOL) {
+        process.stderr.write(`lobster transport: invalid protocol frame\n`)
+        continue
+      }
+      if (parsed.type === 'inbound' && isRecord(parsed.message)) {
+        await this.inboundHandler?.(parsed.message as LobsterInboundMessage)
+        continue
+      }
+      if (parsed.type === 'response') {
+        this.handleResponse(parsed as LobsterResponse)
+      }
+    }
+  }
+
+  private handleResponse(response: LobsterResponse): void {
+    const pending = this.pending.get(response.id)
+    if (!pending) return
+    this.pending.delete(response.id)
+    if (response.ok) {
+      pending.resolve(response.result)
+    } else {
+      pending.reject(new Error(response.error))
+    }
+  }
+}
+
+const lobsterTransport = LOBSTER_TRANSPORT_SOCKET
+  ? new LobsterTransportClient(LOBSTER_TRANSPORT_SOCKET)
+  : null
 
 type PendingEntry = {
   senderId: string
@@ -519,15 +679,13 @@ async function transcribeViaCli(path: string): Promise<CliResult | null> {
     process.stderr.write('discord: transcribeViaCli skipped — TRANSCRIBE_CLI_BIN not set\n')
     return null
   }
-  let ctxPath: string | null = null
   try {
-    const ctx = await captureTmuxContext()
+    // Do NOT pass the tmux pane as transcribe context. Feeding the bot's own
+    // on-screen conversation to gpt-4o-transcribe made it echo that text instead
+    // of transcribing the audio on short utterances (context-bleed confabulation,
+    // 2026-06-03). Proper-noun disambiguation is handled by the transcribe CLI's
+    // vocabulary.txt.
     const args: string[] = [path, '--json']
-    if (ctx && ctx.trim().length > 0) {
-      ctxPath = `/tmp/discord-ctx-${process.pid}-${Date.now()}.txt`
-      writeFileSync(ctxPath, ctx)
-      args.push('--context-file', ctxPath, '--context-source', 'tmux')
-    }
     const { stdout } = await execFileAsync(
       TRANSCRIBE_CLI_BIN,
       args,
@@ -543,10 +701,6 @@ async function transcribeViaCli(path: string): Promise<CliResult | null> {
     const msg = err?.stderr ? String(err.stderr) : String(err)
     process.stderr.write(`discord: CLI transcription exec failed: ${msg}\n`)
     return null
-  } finally {
-    if (ctxPath) {
-      try { rmSync(ctxPath, { force: true }) } catch {}
-    }
   }
 }
 
@@ -658,6 +812,10 @@ mcp.setNotificationHandler(
   }),
   async ({ params }) => {
     const { request_id, tool_name, description, input_preview } = params
+    if (lobsterTransport) {
+      await lobsterTransport.request('permission_request', params)
+      return
+    }
     pendingPermissions.set(request_id, { tool_name, description, input_preview })
     const access = loadAccess()
     const text = `🔐 Permission: ${tool_name}`
@@ -708,6 +866,48 @@ mcp.setNotificationHandler(
     }
   },
 )
+
+async function handleLobsterToolRequest(name: string, args: Record<string, unknown>) {
+  if (!lobsterTransport) throw new Error('lobster transport not configured')
+  if (
+    name !== 'reply' &&
+    name !== 'react' &&
+    name !== 'edit_message' &&
+    name !== 'download_attachment' &&
+    name !== 'fetch_messages'
+  ) {
+    return {
+      content: [{ type: 'text', text: `unknown tool: ${name}` }],
+      isError: true,
+    }
+  }
+
+  if (name === 'reply') {
+    const files = (args.files as string[] | undefined) ?? []
+    for (const f of files) {
+      assertSendable(f)
+      const st = statSync(f)
+      if (st.size > MAX_ATTACHMENT_BYTES) {
+        throw new Error(`file too large: ${f} (${(st.size / 1024 / 1024).toFixed(1)}MB, max 25MB)`)
+      }
+    }
+    if (files.length > 10) throw new Error('Discord allows max 10 attachments per message')
+  }
+
+  const result = await lobsterTransport.request(name, args)
+  return { content: [{ type: 'text', text: formatLobsterResult(result, name) }] }
+}
+
+function formatLobsterResult(result: unknown, name: string): string {
+  if (typeof result === 'string') return result
+  if (isRecord(result) && typeof result.text === 'string') return result.text
+  if (result == null) return `${name} completed`
+  return JSON.stringify(result)
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
 
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
@@ -793,6 +993,9 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
 mcp.setRequestHandler(CallToolRequestSchema, async req => {
   const args = (req.params.arguments ?? {}) as Record<string, unknown>
   try {
+    if (lobsterTransport) {
+      return await handleLobsterToolRequest(req.params.name, args)
+    }
     switch (req.params.name) {
       case 'reply': {
         const chat_id = args.chat_id as string
@@ -922,6 +1125,7 @@ function shutdown(): void {
   shuttingDown = true
   process.stderr.write('discord channel: shutting down\n')
   setTimeout(() => process.exit(0), 2000)
+  lobsterTransport?.close()
   void Promise.resolve(client.destroy()).finally(() => process.exit(0))
 }
 process.stdin.on('end', shutdown)
@@ -1003,11 +1207,6 @@ client.on('interactionCreate', async (interaction: Interaction) => {
   await interaction
     .update({ content: `${interaction.message.content}\n\n${label}`, components: [] })
     .catch(() => {})
-})
-
-client.on('messageCreate', msg => {
-  if (msg.author.bot) return
-  handleInbound(msg).catch(e => process.stderr.write(`discord: handleInbound failed: ${e}\n`))
 })
 
 async function handleInbound(msg: Message): Promise<void> {
@@ -1175,11 +1374,27 @@ async function handleInbound(msg: Message): Promise<void> {
   })
 }
 
-client.once('ready', c => {
-  process.stderr.write(`discord channel: gateway connected as ${c.user.tag}\n`)
-})
+if (lobsterTransport) {
+  lobsterTransport.onInbound(message => {
+    return mcp.notification({
+      method: 'notifications/claude/channel',
+      params: message,
+    })
+  })
+  await lobsterTransport.connect()
+  process.stderr.write(`discord channel: lobster transport connected at ${LOBSTER_TRANSPORT_SOCKET}\n`)
+} else {
+  client.on('messageCreate', msg => {
+    if (msg.author.bot) return
+    handleInbound(msg).catch(e => process.stderr.write(`discord: handleInbound failed: ${e}\n`))
+  })
 
-client.login(TOKEN).catch(err => {
-  process.stderr.write(`discord channel: login failed: ${err}\n`)
-  process.exit(1)
-})
+  client.once('ready', c => {
+    process.stderr.write(`discord channel: gateway connected as ${c.user.tag}\n`)
+  })
+
+  client.login(TOKEN as string).catch(err => {
+    process.stderr.write(`discord channel: login failed: ${err}\n`)
+    process.exit(1)
+  })
+}
