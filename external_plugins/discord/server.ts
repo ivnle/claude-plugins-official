@@ -51,7 +51,9 @@ try {
   chmodSync(ENV_FILE, 0o600)
   for (const line of readFileSync(ENV_FILE, 'utf8').split('\n')) {
     const m = line.match(/^(\w+)=(.*)$/)
-    if (m && process.env[m[1]] === undefined) process.env[m[1]] = m[2]
+    // Treat an empty value as unset: plugin .mcp.json env blocks expand missing vars to '',
+    // which would otherwise shadow this file (the documented home for the token).
+    if (m && (process.env[m[1]] === undefined || process.env[m[1]] === '')) process.env[m[1]] = m[2]
   }
 } catch {}
 
