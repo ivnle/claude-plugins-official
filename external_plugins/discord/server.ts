@@ -33,7 +33,7 @@ import { randomBytes } from 'crypto'
 import { execFile } from 'child_process'
 import { createConnection, type Socket } from 'net'
 import { promisify } from 'util'
-import { readFileSync, writeFileSync, appendFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
+import { readFileSync, writeFileSync, appendFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync, openSync, closeSync, unlinkSync } from 'fs'
 import { homedir } from 'os'
 import { join, sep, dirname } from 'path'
 
@@ -69,6 +69,83 @@ if (!LOBSTER_TRANSPORT_SOCKET && !TOKEN) {
   )
   process.exit(1)
 }
+// Single-owner lock on the state dir.
+//
+// A Discord token supports only one logical owner, but the gateway does NOT
+// reject a second connection -- it treats it as sharding, so two processes
+// both receive every message and both reply, with no error anywhere. That is
+// extremely confusing to diagnose from the Discord side.
+//
+// Standalone mode only: under lobster transport the runner owns the gateway
+// and multiple engine clients on one socket are legitimate.
+const LOCK_FILE = join(STATE_DIR, '.owner.lock')
+
+function lockHolder(): number {
+  try {
+    const pid = Number.parseInt(readFileSync(LOCK_FILE, 'utf8').trim(), 10)
+    if (Number.isInteger(pid) && pid > 0) return pid
+  } catch {}
+  return 0
+}
+
+function pidAlive(pid: number): boolean {
+  try { process.kill(pid, 0); return true } catch { return false }
+}
+
+function sleepSync(ms: number): void {
+  // Bun/Node have no sync sleep; Atomics.wait on a throwaway buffer is the
+  // standard trick. This runs before the event loop matters, at startup only.
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
+}
+
+/** Claim the state dir, evicting an existing owner. Newest instance wins:
+ *  attaching a bot to a new session should just work, rather than failing and
+ *  making you hunt down which old pane still holds it. */
+function acquireStateDirLock(): void {
+  for (let attempt = 0; attempt < 40; attempt++) {
+    try {
+      const fd = openSync(LOCK_FILE, 'wx', 0o600)
+      writeFileSync(fd, `${process.pid}\n`)
+      closeSync(fd)
+      return
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err
+      const holder = lockHolder()
+      if (holder === process.pid) return
+      if (holder > 0 && pidAlive(holder)) {
+        if (attempt === 0) {
+          process.stderr.write(
+            `discord channel: taking over ${STATE_DIR} from pid ${holder}\n` +
+            `  one token supports one live session; the older one is being closed\n`,
+          )
+          try { process.kill(holder, 'SIGTERM') } catch {}
+        }
+        sleepSync(250)
+        // Escalate if it will not go quietly, so a wedged holder cannot block us.
+        if (attempt === 20) { try { process.kill(holder, 'SIGKILL') } catch {} }
+        continue
+      }
+      try { unlinkSync(LOCK_FILE) } catch {}
+    }
+  }
+  process.stderr.write(`discord channel: could not acquire ${LOCK_FILE}\n`)
+  process.exit(1)
+}
+
+if (!LOBSTER_TRANSPORT_SOCKET) {
+  acquireStateDirLock()
+  const releaseLock = (): void => {
+    try {
+      const holder = Number.parseInt(readFileSync(LOCK_FILE, 'utf8').trim(), 10)
+      if (holder === process.pid) unlinkSync(LOCK_FILE)
+    } catch {}
+  }
+  process.on('exit', releaseLock)
+  for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
+    process.on(sig, () => { releaseLock(); process.exit(0) })
+  }
+}
+
 const INBOX_DIR = join(STATE_DIR, 'inbox')
 
 // Last-resort safety net — without these the process dies silently on any
